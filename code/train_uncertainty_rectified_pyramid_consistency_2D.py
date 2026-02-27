@@ -56,9 +56,9 @@ parser.add_argument('--labeled_num', type=int, default=7,
 # costs
 parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')
 parser.add_argument('--consistency', type=float,
-                    default=0.1, help='consistency')
+                    default=0.3, help='consistency')
 parser.add_argument('--consistency_rampup', type=float,
-                    default=200.0, help='consistency_rampup')
+                    default=1000.0, help='consistency_rampup')
 args = parser.parse_args()
 
 
