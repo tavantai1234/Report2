@@ -1,4 +1,5 @@
 import argparse
+import copy
 import logging
 import os
 import random
@@ -53,6 +54,7 @@ parser.add_argument('--labeled_bs', type=int, default=12,
 parser.add_argument('--labeled_num', type=int, default=7,
                     help='labeled data')
 # costs
+parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')
 parser.add_argument('--consistency', type=float,
                     default=0.1, help='consistency')
 parser.add_argument('--consistency_rampup', type=float,
@@ -78,6 +80,13 @@ def get_current_consistency_weight(epoch):
     return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
 
 
+def update_ema_variables(model, ema_model, alpha, global_step):
+    # Use the true average until the exponential average is more correct
+    alpha = min(1 - 1 / (global_step + 1), alpha)
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
+
+
 def train(args, snapshot_path):
     base_lr = args.base_lr
     num_classes = args.num_classes
@@ -86,6 +95,17 @@ def train(args, snapshot_path):
 
     model = net_factory(net_type=args.model, in_chns=1,
                         class_num=num_classes)
+    
+    # Create EMA teacher model
+    ema_model = net_factory(net_type=args.model, in_chns=1,
+                            class_num=num_classes)
+    for param in ema_model.parameters():
+        param.detach_()
+    
+    # Move models to GPU
+    model = model.cuda()
+    ema_model = ema_model.cuda()
+    ema_model.eval()
 
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id)
@@ -205,6 +225,9 @@ def train(args, snapshot_path):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
+            # Update EMA teacher model
+            update_ema_variables(model, ema_model, args.ema_decay, iter_num)
 
             lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
             for param_group in optimizer.param_groups:
@@ -262,6 +285,15 @@ def train(args, snapshot_path):
                                              '{}_best_model.pth'.format(args.model))
                     torch.save(model.state_dict(), save_mode_path)
                     torch.save(model.state_dict(), save_best)
+                    
+                    # Save EMA model
+                    save_ema_path = os.path.join(snapshot_path,
+                                                 'iter_{}_dice_{}_ema.pth'.format(
+                                                     iter_num, round(best_performance, 4)))
+                    save_best_ema = os.path.join(snapshot_path,
+                                                 '{}_best_model_ema.pth'.format(args.model))
+                    torch.save(ema_model.state_dict(), save_ema_path)
+                    torch.save(ema_model.state_dict(), save_best_ema)
 
                 logging.info(
                     'iteration %d : mean_dice : %f mean_hd95 : %f' % (iter_num, performance, mean_hd95))
@@ -272,6 +304,12 @@ def train(args, snapshot_path):
                     snapshot_path, 'iter_' + str(iter_num) + '.pth')
                 torch.save(model.state_dict(), save_mode_path)
                 logging.info("save model to {}".format(save_mode_path))
+                
+                # Save EMA model checkpoint
+                save_ema_path = os.path.join(
+                    snapshot_path, 'iter_' + str(iter_num) + '_ema.pth')
+                torch.save(ema_model.state_dict(), save_ema_path)
+                logging.info("save EMA model to {}".format(save_ema_path))
 
             if iter_num >= max_iterations:
                 break
