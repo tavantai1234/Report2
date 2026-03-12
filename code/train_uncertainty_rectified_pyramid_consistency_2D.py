@@ -1,5 +1,4 @@
 import argparse
-import copy
 import logging
 import os
 import random
@@ -54,11 +53,18 @@ parser.add_argument('--labeled_bs', type=int, default=12,
 parser.add_argument('--labeled_num', type=int, default=7,
                     help='labeled data')
 # costs
-parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')
 parser.add_argument('--consistency', type=float,
-                    default=0.3, help='consistency')
+                    default=0.1, help='consistency')
 parser.add_argument('--consistency_rampup', type=float,
-                    default=1000.0, help='consistency_rampup')
+                    default=200.0, help='consistency_rampup')
+parser.add_argument('--ema_decay', type=float, default=0.99,
+                    help='ema decay for teacher model')
+parser.add_argument('--entropy_threshold', type=float, default=0.75,
+                    help='entropy threshold as fraction of max entropy')
+parser.add_argument('--lambda_boundary', type=float, default=0.1,
+                    help='boundary loss weight')
+parser.add_argument('--surface_dice_tolerance', type=int, default=1,
+                    help='surface dice tolerance in pixels')
 args = parser.parse_args()
 
 
@@ -81,10 +87,9 @@ def get_current_consistency_weight(epoch):
 
 
 def update_ema_variables(model, ema_model, alpha, global_step):
-    # Use the true average until the exponential average is more correct
-    alpha = min(1 - 1 / (global_step + 1), alpha)
+    alpha = min(1.0 - 1.0 / (global_step + 1.0), alpha)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
-        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
+        ema_param.data.mul_(alpha).add_(param.data, alpha=1.0 - alpha)
 
 
 def train(args, snapshot_path):
@@ -95,17 +100,12 @@ def train(args, snapshot_path):
 
     model = net_factory(net_type=args.model, in_chns=1,
                         class_num=num_classes)
-    
-    # Create EMA teacher model
-    ema_model = net_factory(net_type=args.model, in_chns=1,
-                            class_num=num_classes)
-    for param in ema_model.parameters():
-        param.detach_()
-    
-    # Move models to GPU
-    model = model.cuda()
-    ema_model = ema_model.cuda()
-    ema_model.eval()
+    teacher_model = net_factory(net_type=args.model, in_chns=1,
+                                class_num=num_classes)
+    teacher_model.load_state_dict(model.state_dict())
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+    teacher_model.eval()
 
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id)
@@ -150,12 +150,26 @@ def train(args, snapshot_path):
             volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
-            outputs, outputs_aux1, outputs_aux2, outputs_aux3 = model(
-                volume_batch)
+            outputs, outputs_aux1, outputs_aux2, outputs_aux3 = model(volume_batch)
             outputs_soft = torch.softmax(outputs, dim=1)
             outputs_aux1_soft = torch.softmax(outputs_aux1, dim=1)
             outputs_aux2_soft = torch.softmax(outputs_aux2, dim=1)
             outputs_aux3_soft = torch.softmax(outputs_aux3, dim=1)
+
+            with torch.no_grad():
+                teacher_out, teacher_aux1, teacher_aux2, teacher_aux3 = teacher_model(
+                    volume_batch)
+                teacher_out_soft = torch.softmax(teacher_out, dim=1)
+                teacher_aux1_soft = torch.softmax(teacher_aux1, dim=1)
+                teacher_aux2_soft = torch.softmax(teacher_aux2, dim=1)
+                teacher_aux3_soft = torch.softmax(teacher_aux3, dim=1)
+                teacher_preds = (teacher_out_soft + teacher_aux1_soft +
+                                 teacher_aux2_soft + teacher_aux3_soft) / 4
+                entropy = -torch.sum(
+                    teacher_preds * torch.log(teacher_preds + 1e-6), dim=1, keepdim=True)
+                max_entropy = np.log(num_classes)
+                entropy_threshold = args.entropy_threshold * max_entropy
+                entropy_mask = (entropy < entropy_threshold).float()
 
             loss_ce = ce_loss(outputs[:args.labeled_bs],
                               label_batch[:args.labeled_bs][:].long())
@@ -175,59 +189,69 @@ def train(args, snapshot_path):
             loss_dice_aux3 = dice_loss(
                 outputs_aux3_soft[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1))
 
-            supervised_loss = (loss_ce+loss_ce_aux1+loss_ce_aux2+loss_ce_aux3 +
-                               loss_dice+loss_dice_aux1+loss_dice_aux2+loss_dice_aux3)/8
+            supervised_loss = (loss_ce + loss_ce_aux1 + loss_ce_aux2 + loss_ce_aux3 +
+                               loss_dice + loss_dice_aux1 + loss_dice_aux2 + loss_dice_aux3) / 8
 
-            preds = (outputs_soft+outputs_aux1_soft +
-                     outputs_aux2_soft+outputs_aux3_soft)/4
+            boundary_loss = losses.compute_boundary_loss(
+                outputs_soft[:args.labeled_bs],
+                label_batch[:args.labeled_bs],
+                num_classes
+            )
 
             variance_main = torch.sum(kl_distance(
-                torch.log(outputs_soft[args.labeled_bs:]), preds[args.labeled_bs:]), dim=1, keepdim=True)
+                torch.log(outputs_soft[args.labeled_bs:]),
+                teacher_preds[args.labeled_bs:]), dim=1, keepdim=True)
             exp_variance_main = torch.exp(-variance_main)
 
             variance_aux1 = torch.sum(kl_distance(
-                torch.log(outputs_aux1_soft[args.labeled_bs:]), preds[args.labeled_bs:]), dim=1, keepdim=True)
+                torch.log(outputs_aux1_soft[args.labeled_bs:]),
+                teacher_preds[args.labeled_bs:]), dim=1, keepdim=True)
             exp_variance_aux1 = torch.exp(-variance_aux1)
 
             variance_aux2 = torch.sum(kl_distance(
-                torch.log(outputs_aux2_soft[args.labeled_bs:]), preds[args.labeled_bs:]), dim=1, keepdim=True)
+                torch.log(outputs_aux2_soft[args.labeled_bs:]),
+                teacher_preds[args.labeled_bs:]), dim=1, keepdim=True)
             exp_variance_aux2 = torch.exp(-variance_aux2)
 
             variance_aux3 = torch.sum(kl_distance(
-                torch.log(outputs_aux3_soft[args.labeled_bs:]), preds[args.labeled_bs:]), dim=1, keepdim=True)
+                torch.log(outputs_aux3_soft[args.labeled_bs:]),
+                teacher_preds[args.labeled_bs:]), dim=1, keepdim=True)
             exp_variance_aux3 = torch.exp(-variance_aux3)
 
             consistency_weight = get_current_consistency_weight(iter_num//150)
             consistency_dist_main = (
-                preds[args.labeled_bs:] - outputs_soft[args.labeled_bs:]) ** 2
+                teacher_preds[args.labeled_bs:] - outputs_soft[args.labeled_bs:]) ** 2
+            consistency_mask = entropy_mask[args.labeled_bs:]
 
             consistency_loss_main = torch.mean(
-                consistency_dist_main * exp_variance_main) / (torch.mean(exp_variance_main) + 1e-8) + torch.mean(variance_main)
+                consistency_dist_main * exp_variance_main * consistency_mask) / (
+                    torch.mean(exp_variance_main * consistency_mask) + 1e-8) + torch.mean(variance_main)
 
             consistency_dist_aux1 = (
-                preds[args.labeled_bs:] - outputs_aux1_soft[args.labeled_bs:]) ** 2
+                teacher_preds[args.labeled_bs:] - outputs_aux1_soft[args.labeled_bs:]) ** 2
             consistency_loss_aux1 = torch.mean(
-                consistency_dist_aux1 * exp_variance_aux1) / (torch.mean(exp_variance_aux1) + 1e-8) + torch.mean(variance_aux1)
+                consistency_dist_aux1 * exp_variance_aux1 * consistency_mask) / (
+                    torch.mean(exp_variance_aux1 * consistency_mask) + 1e-8) + torch.mean(variance_aux1)
 
             consistency_dist_aux2 = (
-                preds[args.labeled_bs:] - outputs_aux2_soft[args.labeled_bs:]) ** 2
+                teacher_preds[args.labeled_bs:] - outputs_aux2_soft[args.labeled_bs:]) ** 2
             consistency_loss_aux2 = torch.mean(
-                consistency_dist_aux2 * exp_variance_aux2) / (torch.mean(exp_variance_aux2) + 1e-8) + torch.mean(variance_aux2)
+                consistency_dist_aux2 * exp_variance_aux2 * consistency_mask) / (
+                    torch.mean(exp_variance_aux2 * consistency_mask) + 1e-8) + torch.mean(variance_aux2)
 
             consistency_dist_aux3 = (
-                preds[args.labeled_bs:] - outputs_aux3_soft[args.labeled_bs:]) ** 2
+                teacher_preds[args.labeled_bs:] - outputs_aux3_soft[args.labeled_bs:]) ** 2
             consistency_loss_aux3 = torch.mean(
-                consistency_dist_aux3 * exp_variance_aux3) / (torch.mean(exp_variance_aux3) + 1e-8) + torch.mean(variance_aux3)
+                consistency_dist_aux3 * exp_variance_aux3 * consistency_mask) / (
+                    torch.mean(exp_variance_aux3 * consistency_mask) + 1e-8) + torch.mean(variance_aux3)
 
             consistency_loss = (consistency_loss_main + consistency_loss_aux1 +
                                 consistency_loss_aux2 + consistency_loss_aux3) / 4
-            loss = supervised_loss + consistency_weight * consistency_loss
+            loss = supervised_loss + consistency_weight * consistency_loss + args.lambda_boundary * boundary_loss
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
-            # Update EMA teacher model
-            update_ema_variables(model, ema_model, args.ema_decay, iter_num)
+            update_ema_variables(model, teacher_model, args.ema_decay, iter_num)
 
             lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
             for param_group in optimizer.param_groups:
@@ -238,6 +262,7 @@ def train(args, snapshot_path):
             writer.add_scalar('info/total_loss', loss, iter_num)
             writer.add_scalar('info/loss_ce', loss_ce, iter_num)
             writer.add_scalar('info/loss_dice', loss_dice, iter_num)
+            writer.add_scalar('info/loss_boundary', boundary_loss, iter_num)
             writer.add_scalar('info/consistency_loss',
                               consistency_loss, iter_num)
             writer.add_scalar('info/consistency_weight',
@@ -259,22 +284,33 @@ def train(args, snapshot_path):
             if iter_num > 0 and iter_num % 200 == 0:
                 model.eval()
                 metric_list = 0.0
+                ece_list = 0.0
                 for i_batch, sampled_batch in enumerate(valloader):
-                    metric_i = test_single_volume_ds(
-                        sampled_batch["image"], sampled_batch["label"], model, classes=num_classes)
+                    metric_i, ece_i = test_single_volume_ds(
+                        sampled_batch["image"],
+                        sampled_batch["label"],
+                        model,
+                        classes=num_classes,
+                        surface_dice_tolerance=args.surface_dice_tolerance,
+                        return_ece=True)
                     metric_list += np.array(metric_i)
+                    ece_list += ece_i
                 metric_list = metric_list / len(db_val)
+                ece_mean = ece_list / len(db_val)
                 for class_i in range(num_classes-1):
                     writer.add_scalar('info/val_{}_dice'.format(class_i+1),
                                       metric_list[class_i, 0], iter_num)
                     writer.add_scalar('info/val_{}_hd95'.format(class_i+1),
                                       metric_list[class_i, 1], iter_num)
+                    writer.add_scalar('info/val_{}_surface_dice'.format(class_i+1),
+                                      metric_list[class_i, 2], iter_num)
 
                 performance = np.mean(metric_list, axis=0)[0]
 
                 mean_hd95 = np.mean(metric_list, axis=0)[1]
                 writer.add_scalar('info/val_mean_dice', performance, iter_num)
                 writer.add_scalar('info/val_mean_hd95', mean_hd95, iter_num)
+                writer.add_scalar('info/val_ece', ece_mean, iter_num)
 
                 if performance > best_performance:
                     best_performance = performance
@@ -285,15 +321,6 @@ def train(args, snapshot_path):
                                              '{}_best_model.pth'.format(args.model))
                     torch.save(model.state_dict(), save_mode_path)
                     torch.save(model.state_dict(), save_best)
-                    
-                    # Save EMA model
-                    save_ema_path = os.path.join(snapshot_path,
-                                                 'iter_{}_dice_{}_ema.pth'.format(
-                                                     iter_num, round(best_performance, 4)))
-                    save_best_ema = os.path.join(snapshot_path,
-                                                 '{}_best_model_ema.pth'.format(args.model))
-                    torch.save(ema_model.state_dict(), save_ema_path)
-                    torch.save(ema_model.state_dict(), save_best_ema)
 
                 logging.info(
                     'iteration %d : mean_dice : %f mean_hd95 : %f' % (iter_num, performance, mean_hd95))
@@ -304,12 +331,6 @@ def train(args, snapshot_path):
                     snapshot_path, 'iter_' + str(iter_num) + '.pth')
                 torch.save(model.state_dict(), save_mode_path)
                 logging.info("save model to {}".format(save_mode_path))
-                
-                # Save EMA model checkpoint
-                save_ema_path = os.path.join(
-                    snapshot_path, 'iter_' + str(iter_num) + '_ema.pth')
-                torch.save(ema_model.state_dict(), save_ema_path)
-                logging.info("save EMA model to {}".format(save_ema_path))
 
             if iter_num >= max_iterations:
                 break
